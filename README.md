@@ -1,15 +1,16 @@
 # AstrBot Enhance Mode
 
-**Version**: `v0.2.4`  
+**Version**: `v0.2.5`
 **Author**: `阿汐`
 
 `astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG、网页浏览与可视化 WebUI。
 
-## Update Notes (v0.2.4)
+## Update Notes (v0.2.5)
 
-- 主动回复 `model_choice` 新增独立模型配置：`active_reply.model_choice_provider_id`。
-- 当配置的 `model_choice_provider_id` 无效时，自动回退到当前会话默认 Provider，并输出告警日志。
-- 配置 schema 与文档已同步，WebUI 可直接选择该 Provider。
+- 群聊回复上下文改为按当前消息 ID 截断，当前消息只作为独立回复目标出现一次。
+- 当前请求不会再读取等待期间后续到达的群消息，避免回复对象错位和“复读”误判。
+- 引用目标仍在历史窗口时只记录引用消息 ID，不再重复注入被引用消息全文。
+- 无法建立可靠消息边界时明确记录错误并停止本轮请求，不使用完整历史静默回退。
 - 新增联网搜索工具 `grok_web_search`（可在 `web_search` 配置分组中启用并指定专用 provider，不跟随当前会话 provider）。
 - `grok_web_search` 改为直连 provider 的 `api_base/key/model` 发起请求，并支持 `request_mode` 与 `base_url_override` 配置。
 - 新增基于 `agent-browser` 的网页浏览工具组，可在 `browser_tool` 配置分组中启用。
@@ -41,6 +42,7 @@
 
 - React 模式（群聊上下文增强总开关）
 - 群聊历史增强（可注入发送者 ID、角色标签、消息编号）
+- 按消息 ID 隔离每轮回复上下文，排除当前消息之后到达的内容
 - 图片转述（可选，默认记录 `[Image]`，由工具按需生成描述并回填历史）
 - 角色显示（在 system reminder 注入 `admin/member`）
 

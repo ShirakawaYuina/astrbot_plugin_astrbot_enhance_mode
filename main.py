@@ -30,6 +30,15 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.utils.io import download_image_by_url
 
 from .ban_control import BanStore, parse_duration_seconds
+from .history_context import (
+    HistoryBoundaryError,
+    build_current_message_reply_prompt,
+    extract_message_id_from_history_line,
+    format_quote_for_history,
+    history_retained_before_append,
+    normalize_message_id,
+    split_history_at_message,
+)
 from .memory_rag_store import MemoryRAGStore
 from .plugin_config import PluginConfig, parse_plugin_config
 from .runtime_state import RuntimeState
@@ -44,7 +53,6 @@ from .tag_utils import (
 from .webui import RAGWebUIServer
 
 IMAGE_MARKER_PATTERN = re.compile(r"\[Image(?:: [^\]]*)?\]")
-MSG_ID_PATTERN = re.compile(r"#msg([^:]+):")
 
 
 class Main(star.Star):
@@ -122,19 +130,11 @@ class Main(star.Star):
 
     @staticmethod
     def _normalize_message_id(raw: str | int | None) -> str:
-        text = str(raw or "").strip()
-        if text.startswith("#msg"):
-            text = text[4:]
-        if text.endswith(":"):
-            text = text[:-1]
-        return text.strip()
+        return normalize_message_id(raw)
 
     @staticmethod
     def _extract_message_id_from_history_line(line: str) -> str:
-        matched = MSG_ID_PATTERN.search(str(line or ""))
-        if not matched:
-            return ""
-        return str(matched.group(1) or "").strip()
+        return extract_message_id_from_history_line(line)
 
     @staticmethod
     def _replace_image_marker_at_index(
@@ -431,7 +431,7 @@ class Main(star.Star):
                     "access_password": webui_cfg.access_password,
                     "session_timeout": webui_cfg.session_timeout,
                 },
-                plugin_version="0.2.4",
+                plugin_version="0.2.5",
             )
             await self.rag_webui_server.start()
             logger.info(
@@ -1836,6 +1836,14 @@ class Main(star.Star):
         normalized_msg_id = self._normalize_message_id(msg_id)
         image_urls: list[str] = []
 
+        # 引用格式化需要检查目标原消息是否仍在本会话历史中，因此先取得当前会话容器。
+        self._touch_origin(event.unified_msg_origin, cfg)
+        chats = self.runtime.session_chats[event.unified_msg_origin]
+        retained_history_for_quote = history_retained_before_append(
+            chats,
+            history_cfg.max_messages,
+        )
+
         if history_cfg.include_sender_id and history_cfg.include_role_tag:
             sender_id = event.get_sender_id()
             role_tag = "(admin)" if event.is_admin() else "(member)"
@@ -1855,10 +1863,14 @@ class Main(star.Star):
                 quote_nick = comp.sender_nickname or "Unknown"
                 quote_text = (comp.message_str or "").strip() or "..."
                 quote_id = self._normalize_message_id(getattr(comp, "id", ""))
-                if quote_id:
-                    parts.append(f" [Quote #msg{quote_id} {quote_nick}: {quote_text}]")
-                else:
-                    parts.append(f" [Quote {quote_nick}: {quote_text}]")
+                parts.append(
+                    format_quote_for_history(
+                        quote_message_id=quote_id,
+                        quote_nickname=quote_nick,
+                        quote_text=quote_text,
+                        history_lines=retained_history_for_quote,
+                    )
+                )
             elif isinstance(comp, Plain):
                 parts.append(f" {comp.text}")
             elif isinstance(comp, Image):
@@ -1871,8 +1883,6 @@ class Main(star.Star):
         final_message = "".join(parts)
         logger.debug(f"enhance-mode | {event.unified_msg_origin} | {final_message}")
 
-        self._touch_origin(event.unified_msg_origin, cfg)
-        chats = self.runtime.session_chats[event.unified_msg_origin]
         chats.append(final_message)
         if len(chats) > history_cfg.max_messages:
             removed_line = chats.pop(0)
@@ -1909,13 +1919,39 @@ class Main(star.Star):
             return
 
         self._touch_origin(event.unified_msg_origin, cfg)
-        bounded_chats = bounded_chat_history_text(
-            self.runtime.session_chats[event.unified_msg_origin]
+        history_snapshot = tuple(self.runtime.session_chats[event.unified_msg_origin])
+        current_message_id = self._normalize_message_id(event.message_obj.message_id)
+        try:
+            history_boundary = split_history_at_message(
+                history_snapshot,
+                current_message_id,
+            )
+        except HistoryBoundaryError as exc:
+            # 不能可靠定位当前消息时明确暴露问题，禁止用最后一条或完整历史猜测边界。
+            logger.error(
+                "enhance-mode | group context boundary error | "
+                "origin=%s message_id=%s history_size=%s error=%s",
+                event.unified_msg_origin,
+                current_message_id or "<empty>",
+                len(history_snapshot),
+                exc,
+            )
+            event.stop_event()
+            return
+
+        bounded_history_before = bounded_chat_history_text(
+            list(history_boundary.history_before)
+        )
+        bounded_history_through_current = bounded_chat_history_text(
+            list(history_boundary.history_through_current)
         )
         logger.debug(
-            "enhance-mode | injecting group context | origin=%s history_size=%s",
+            "enhance-mode | injecting group context | "
+            "origin=%s history_before=%s history_through_current=%s excluded_after=%s",
             event.unified_msg_origin,
-            len(self.runtime.session_chats[event.unified_msg_origin]),
+            len(history_boundary.history_before),
+            len(history_boundary.history_through_current),
+            history_boundary.excluded_after_count,
         )
         interaction_instructions = build_interaction_instructions(
             cfg.group_features.mention_parse,
@@ -1953,8 +1989,10 @@ class Main(star.Star):
             )
             active_mode = event.get_extra("_enhance_active_reply_mode", "")
             if is_active_triggered and active_mode == "model_choice":
+                # model_choice 可以从截至触发消息的历史中选目标，但不得看到之后到达的消息。
                 req.prompt = (
-                    f"You are now in a chatroom. The chat history is as follows:\n{bounded_chats}\n\n"
+                    "You are now in a chatroom. The chat history through the triggering message "
+                    f"is as follows:\n{bounded_history_through_current}\n\n"
                     "You decided to actively join this conversation because some recent messages are worth replying to.\n"
                     "Choose the message(s) you want to respond to from the chat history above, "
                     "and compose a natural reply. Quote the message you choose in most cases.\n"
@@ -1963,22 +2001,16 @@ class Main(star.Star):
                     f"{interaction_instructions}"
                 )
             else:
-                prompt = req.prompt
-                req.prompt = (
-                    f"You are now in a chatroom. The chat history is as follows:\n{bounded_chats}\n\n"
-                    f"Now, a new message is coming: `{prompt}`. "
-                    "Please react to it. Your entire output is your reply to this message. "
-                    "Quote the message which is coming in most cases. "
-                    "Only output your response and do not output any other information. "
-                    "You MUST use the SAME language as the chatroom is using."
-                    f"{interaction_instructions}"
+                req.prompt = build_current_message_reply_prompt(
+                    history_text=bounded_history_before,
+                    current_message=history_boundary.current_message,
+                    interaction_instructions=interaction_instructions,
                 )
             req.contexts = []
         else:
-            req.system_prompt += (
-                "You are now in a chatroom. The chat history is as follows: \n"
-            )
-            req.system_prompt += bounded_chats
+            # 非 React 配置下仍使用同一消息边界，避免当前消息和未来消息进入 system prompt。
+            req.system_prompt += "You are now in a chatroom. The chat history before the current message is as follows: \n"
+            req.system_prompt += bounded_history_before
             req.system_prompt += interaction_instructions
 
     @filter.on_decorating_result()
