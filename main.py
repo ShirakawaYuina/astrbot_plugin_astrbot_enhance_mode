@@ -136,6 +136,45 @@ class Main(star.Star):
     def _extract_message_id_from_history_line(line: str) -> str:
         return extract_message_id_from_history_line(line)
 
+    @classmethod
+    def _replace_image_markers_in_line(
+        cls, line: str, replacements: dict[int, str]
+    ) -> str:
+        if not replacements:
+            return line
+        matches = list(IMAGE_MARKER_PATTERN.finditer(line))
+        if not matches:
+            return line
+        indices = sorted(replacements.keys(), reverse=True)
+        res = line
+        for idx in indices:
+            if idx < 0 or idx >= len(matches):
+                continue
+            target = matches[idx]
+            safe_text = str(replacements[idx] or "").strip().replace("]", ")")
+            replacement = f"[Image: {safe_text}]"
+            res = res[: target.start()] + replacement + res[target.end() :]
+        return res
+
+    @staticmethod
+    def _is_image_caption_mode(cfg: PluginConfig) -> bool:
+        return bool(
+            cfg.group_history.image_caption
+            and cfg.group_history.image_caption_provider_id.strip()
+        )
+
+    @staticmethod
+    def _provider_supports_image(provider: Any) -> bool:
+        if not provider:
+            return False
+        provider_config = getattr(provider, "provider_config", None)
+        if not isinstance(provider_config, dict):
+            return True
+        modalities = provider_config.get("modalities", None)
+        if not modalities:
+            return True
+        return "image" in modalities
+
     @staticmethod
     def _replace_image_marker_at_index(
         line: str, image_index: int, caption: str
@@ -1939,31 +1978,116 @@ class Main(star.Star):
             event.stop_event()
             return
 
-        bounded_history_before = bounded_chat_history_text(
-            list(history_boundary.history_before)
+        is_caption_mode = self._is_image_caption_mode(cfg)
+        provider = (
+            self.context.get_using_provider(event.unified_msg_origin)
+            or self.context.get_using_provider()
         )
+        supports_image = self._provider_supports_image(provider)
+
+        attached_count = 0
+        attached_seq_map: dict[tuple[str, int], int] = {}
+        if not is_caption_mode and supports_image and cfg.group_history.max_attached_images > 0:
+            origin = event.unified_msg_origin
+            registry = self.runtime.image_message_registry.get(origin, {})
+            collected_images: list[tuple[str, int, str]] = []
+            max_attach = cfg.group_history.max_attached_images
+            for line in reversed(history_boundary.history_through_current):
+                msg_id = extract_message_id_from_history_line(line)
+                if not msg_id or msg_id not in registry:
+                    continue
+                entry = registry[msg_id]
+                urls = entry.get("urls")
+                if not isinstance(urls, list) or not urls:
+                    continue
+                for idx in range(len(urls) - 1, -1, -1):
+                    url = str(urls[idx] or "").strip()
+                    if not url:
+                        continue
+                    collected_images.append((msg_id, idx, url))
+                    if len(collected_images) >= max_attach:
+                        break
+                if len(collected_images) >= max_attach:
+                    break
+
+            collected_images.reverse()
+            if req.image_urls is None:
+                req.image_urls = []
+
+            for seq, (msg_id, idx, img_ref) in enumerate(collected_images, 1):
+                attached_seq_map[(msg_id, idx)] = seq
+                local_path = await self._resolve_image_ref_to_local_path(img_ref)
+                img_to_attach = local_path or img_ref
+                if img_to_attach and img_to_attach not in req.image_urls:
+                    req.image_urls.append(img_to_attach)
+            attached_count = len(collected_images)
+
+        def _format_history_line(line: str) -> str:
+            if not attached_seq_map:
+                return line
+            msg_id = extract_message_id_from_history_line(line)
+            if not msg_id:
+                return line
+            line_replacements: dict[int, str] = {}
+            for (m_id, idx), seq in attached_seq_map.items():
+                if m_id == msg_id:
+                    line_replacements[idx] = f"原图已挂载#{seq}"
+            if not line_replacements:
+                return line
+            return self._replace_image_markers_in_line(line, line_replacements)
+
+        formatted_history_before = [
+            _format_history_line(line) for line in history_boundary.history_before
+        ]
+        formatted_current_message = _format_history_line(
+            history_boundary.current_message
+        )
+        formatted_history_through_current = [
+            _format_history_line(line)
+            for line in history_boundary.history_through_current
+        ]
+
+        bounded_history_before = bounded_chat_history_text(formatted_history_before)
         bounded_history_through_current = bounded_chat_history_text(
-            list(history_boundary.history_through_current)
+            formatted_history_through_current
         )
         logger.debug(
             "enhance-mode | injecting group context | "
-            "origin=%s history_before=%s history_through_current=%s excluded_after=%s",
+            "origin=%s history_before=%s history_through_current=%s excluded_after=%s attached_images=%s",
             event.unified_msg_origin,
             len(history_boundary.history_before),
             len(history_boundary.history_through_current),
             history_boundary.excluded_after_count,
+            attached_count,
         )
         interaction_instructions = build_interaction_instructions(
             cfg.group_features.mention_parse,
             cfg.group_history.include_sender_id,
         )
-        interaction_instructions += (
-            "\nIf a history message contains `[Image]` and visual details are necessary, "
-            "you may call `enhance_use_image(message_id, image_index, attach_to_model, write_to_history, prompt)`. "
-            "By default it does both: attach image to this run context and write description back into chat history. "
-            "Set `attach_to_model=false` for history-only. "
-            "Set `write_to_history=false` for attach-only."
-        )
+        if is_caption_mode:
+            interaction_instructions += (
+                "\nIf a history message contains `[Image]` and you need to understand its content, "
+                "call `enhance_use_image(message_id, image_index)`. "
+                "The caption model will generate a description and write it back into chat history."
+            )
+        else:
+            if supports_image:
+                if attached_count > 0:
+                    interaction_instructions += (
+                        f"\nVisual input: The latest {attached_count} image(s) from history have been directly attached "
+                        "to this request (marked as `[Image: 原图已挂载#N]`). Earlier images remain as `[Image]`. "
+                        "If you need to view visual details of earlier images, "
+                        "call `enhance_use_image(message_id, image_index)` to attach them."
+                    )
+                else:
+                    interaction_instructions += (
+                        "\nIf a history message contains `[Image]` and visual details are necessary, "
+                        "call `enhance_use_image(message_id, image_index)` to attach the image to your context."
+                    )
+            else:
+                interaction_instructions += (
+                    "\nCurrent model does not support image modality and image caption is not configured."
+                )
         if cfg.web_search.enable:
             interaction_instructions += (
                 "\nWhen real-time facts or uncertain external information are needed, "
@@ -2003,7 +2127,7 @@ class Main(star.Star):
             else:
                 req.prompt = build_current_message_reply_prompt(
                     history_text=bounded_history_before,
-                    current_message=history_boundary.current_message,
+                    current_message=formatted_current_message,
                     interaction_instructions=interaction_instructions,
                 )
             req.contexts = []
@@ -2580,105 +2704,45 @@ class Main(star.Star):
             captions_map = {}
             message_entry["captions"] = captions_map
 
-        caption = ""
-        caption_cached = False
-        cached_caption = captions_map.get(image_idx)
-        if isinstance(cached_caption, str) and cached_caption.strip():
-            caption = cached_caption.strip()
-            caption_cached = True
-        elif history_requested:
-            try:
-                if not cfg.group_history.image_caption:
-                    yield self._make_text_tool_result(
-                        "Image caption is disabled in enhance mode config."
-                    )
-                    return
-                final_prompt = (
-                    str(prompt or "").strip() or cfg.group_history.image_caption_prompt
-                )
-                caption = await self._get_image_caption(
-                    image_url=image_url,
-                    provider_id=cfg.group_history.image_caption_provider_id,
-                    prompt=final_prompt,
-                    timeout_sec=cfg.global_settings.timeouts.image_caption_sec,
-                )
-                caption = str(caption or "").strip()
-                if caption:
-                    captions_map[image_idx] = caption
-            except Exception as e:
-                logger.exception(
-                    "enhance-mode | use_image caption failed | origin=%s msg_id=%s image_index=%s error=%s",
-                    origin,
-                    normalized_message_id,
-                    index_number,
-                    e,
-                )
-                yield self._make_text_tool_result(
-                    f"Failed to get image description: {e}"
-                )
-                return
+        is_caption_mode = self._is_image_caption_mode(cfg)
 
-        attach_success = False
-        attach_error = ""
-        if attach_requested:
-            resolved_paths_raw = message_entry.get("resolved_paths")
-            if not isinstance(resolved_paths_raw, list) or len(
-                resolved_paths_raw
-            ) != len(urls_raw):
-                resolved_paths_raw = [""] * len(urls_raw)
-                message_entry["resolved_paths"] = resolved_paths_raw
-
-            selected_ref = str(
-                resolved_paths_raw[image_idx] or urls_raw[image_idx] or ""
-            ).strip()
-            if not selected_ref:
-                attach_error = (
-                    f"Image reference is unavailable for message `{normalized_message_id}` "
-                    f"at index {index_number}."
-                )
+        if is_caption_mode:
+            # 模式 1：开启图片转述且配置了转述模型，只执行文字转述并写回历史
+            caption = ""
+            caption_cached = False
+            cached_caption = captions_map.get(image_idx)
+            if isinstance(cached_caption, str) and cached_caption.strip():
+                caption = cached_caption.strip()
+                caption_cached = True
             else:
                 try:
-                    local_path = await self._resolve_image_ref_to_local_path(
-                        selected_ref
+                    final_prompt = (
+                        str(prompt or "").strip() or cfg.group_history.image_caption_prompt
                     )
-                    if not local_path:
-                        attach_error = (
-                            f"Failed to resolve image path for message `{normalized_message_id}` "
-                            f"index {index_number}."
-                        )
-                    else:
-                        resolved_paths_raw[image_idx] = local_path
-                        image_b64, mime_type = self._encode_image_file(local_path)
-                        yield mcp_types.CallToolResult(
-                            content=[
-                                mcp_types.ImageContent(
-                                    type="image",
-                                    data=image_b64,
-                                    mimeType=mime_type,
-                                )
-                            ]
-                        )
-                        attach_success = True
-                        logger.info(
-                            "enhance-mode | use_image attach success | origin=%s msg_id=%s image_index=%s mime=%s",
-                            origin,
-                            normalized_message_id,
-                            index_number,
-                            mime_type,
-                        )
+                    caption = await self._get_image_caption(
+                        image_url=image_url,
+                        provider_id=cfg.group_history.image_caption_provider_id,
+                        prompt=final_prompt,
+                        timeout_sec=cfg.global_settings.timeouts.image_caption_sec,
+                    )
+                    caption = str(caption or "").strip()
+                    if caption:
+                        captions_map[image_idx] = caption
                 except Exception as e:
-                    attach_error = str(e)
                     logger.exception(
-                        "enhance-mode | use_image attach failed | origin=%s msg_id=%s image_index=%s error=%s",
+                        "enhance-mode | use_image caption failed | origin=%s msg_id=%s image_index=%s error=%s",
                         origin,
                         normalized_message_id,
                         index_number,
                         e,
                     )
+                    yield self._make_text_tool_result(
+                        f"Failed to get image description: {e}"
+                    )
+                    return
 
-        history_success = False
-        history_error = ""
-        if history_requested:
+            history_success = False
+            history_error = ""
             if not caption:
                 history_error = "Image description is empty."
             else:
@@ -2700,44 +2764,105 @@ class Main(star.Star):
                         "Failed to apply image description back to runtime history."
                     )
 
-        if attach_requested and history_requested:
-            success = attach_success and history_success
-        elif attach_requested:
-            success = attach_success
-        else:
-            success = history_success
+            payload = {
+                "status": "ok" if history_success else "failed",
+                "success": history_success,
+                "mode": "caption",
+                "origin": origin,
+                "message_id": normalized_message_id,
+                "image_index": index_number,
+                "description": caption,
+                "description_cached": caption_cached,
+                "write_to_history_success": history_success,
+            }
+            if history_error:
+                payload["write_to_history_error"] = history_error
 
-        payload: dict[str, object] = {
-            "status": "ok" if success else "failed",
-            "success": success,
-            "origin": origin,
-            "message_id": normalized_message_id,
-            "image_index": index_number,
-            "attach_requested": attach_requested,
-            "write_to_history_requested": history_requested,
-            "attach_success": attach_success if attach_requested else None,
-            "write_to_history_success": history_success if history_requested else None,
-            "description_cached": caption_cached,
-        }
-        if attach_requested and not history_requested:
-            payload["description"] = caption
-        if attach_error:
-            payload["attach_error"] = attach_error
-        if history_error:
-            payload["write_to_history_error"] = history_error
+            logger.info(
+                "enhance-mode | use_image caption done | origin=%s msg_id=%s image_index=%s success=%s",
+                origin,
+                normalized_message_id,
+                index_number,
+                history_success,
+            )
+            yield self._make_text_tool_result(json.dumps(payload, ensure_ascii=False))
+            return
 
-        logger.info(
-            "enhance-mode | use_image done | origin=%s msg_id=%s image_index=%s attach=%s/%s write=%s/%s success=%s",
-            origin,
-            normalized_message_id,
-            index_number,
-            attach_success,
-            attach_requested,
-            history_success,
-            history_requested,
-            success,
+        # 模式 2：未开启图片转述，只执行原生多模态挂载原图（前提：模型支持多模态）
+        provider = (
+            self.context.get_using_provider(origin)
+            or self.context.get_using_provider()
         )
-        yield self._make_text_tool_result(json.dumps(payload, ensure_ascii=False))
+        if not self._provider_supports_image(provider):
+            yield self._make_text_tool_result(
+                "当前对话模型不支持图像输入（未配置 image 模态），且未启用图片转述能力。"
+            )
+            return
+
+        resolved_paths_raw = message_entry.get("resolved_paths")
+        if not isinstance(resolved_paths_raw, list) or len(
+            resolved_paths_raw
+        ) != len(urls_raw):
+            resolved_paths_raw = [""] * len(urls_raw)
+            message_entry["resolved_paths"] = resolved_paths_raw
+
+        selected_ref = str(
+            resolved_paths_raw[image_idx] or urls_raw[image_idx] or ""
+        ).strip()
+        if not selected_ref:
+            yield self._make_text_tool_result(
+                f"Image reference is unavailable for message `{normalized_message_id}` at index {index_number}."
+            )
+            return
+
+        try:
+            local_path = await self._resolve_image_ref_to_local_path(selected_ref)
+            if not local_path:
+                yield self._make_text_tool_result(
+                    f"Failed to resolve image path for message `{normalized_message_id}` index {index_number}."
+                )
+                return
+
+            resolved_paths_raw[image_idx] = local_path
+            image_b64, mime_type = self._encode_image_file(local_path)
+            yield mcp_types.CallToolResult(
+                content=[
+                    mcp_types.ImageContent(
+                        type="image",
+                        data=image_b64,
+                        mimeType=mime_type,
+                    )
+                ]
+            )
+            logger.info(
+                "enhance-mode | use_image attach success | origin=%s msg_id=%s image_index=%s mime=%s",
+                origin,
+                normalized_message_id,
+                index_number,
+                mime_type,
+            )
+            payload = {
+                "status": "ok",
+                "success": True,
+                "mode": "attach_image",
+                "origin": origin,
+                "message_id": normalized_message_id,
+                "image_index": index_number,
+                "attach_success": True,
+                "mime_type": mime_type,
+            }
+            yield self._make_text_tool_result(json.dumps(payload, ensure_ascii=False))
+            return
+        except Exception as e:
+            logger.exception(
+                "enhance-mode | use_image attach failed | origin=%s msg_id=%s image_index=%s error=%s",
+                origin,
+                normalized_message_id,
+                index_number,
+                e,
+            )
+            yield self._make_text_tool_result(f"Failed to attach image: {e}")
+            return
 
     @llm_tool(name="enhance_memory_rag_write")
     async def memory_rag_write(

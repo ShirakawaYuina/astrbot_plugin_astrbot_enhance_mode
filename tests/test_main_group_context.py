@@ -43,11 +43,37 @@ class _DummyGroupEvent:
         self.stopped = True
 
 
-def _build_plugin(*, active_reply_mode: str = "probability") -> tuple[Main, PluginConfig]:
+class _DummyProvider:
+    def __init__(self, modalities: list[str] | None = None) -> None:
+        self.provider_config = {"modalities": modalities} if modalities is not None else {}
+
+
+class _DummyContext:
+    def __init__(self, provider: object | None = None) -> None:
+        self._provider = provider or _DummyProvider(["image"])
+
+    def get_using_provider(self, *args, **kwargs) -> object:
+        return self._provider
+
+
+def _build_plugin(
+    *,
+    active_reply_mode: str = "probability",
+    image_caption: bool = False,
+    image_caption_provider_id: str = "",
+    max_attached_images: int = 3,
+    modalities: list[str] | None = None,
+) -> tuple[Main, PluginConfig]:
     plugin = Main.__new__(Main)
     plugin.runtime = RuntimeState()
+    plugin.context = _DummyContext(_DummyProvider(modalities if modalities is not None else ["image"]))
     cfg = PluginConfig(
-        group_history=GroupHistoryEnhancementConfig(enable=True),
+        group_history=GroupHistoryEnhancementConfig(
+            enable=True,
+            image_caption=image_caption,
+            image_caption_provider_id=image_caption_provider_id,
+            max_attached_images=max_attached_images,
+        ),
         active_reply=ActiveReplyConfig(enable=True, mode=active_reply_mode),
         group_features=GroupFeatureEnhancementConfig(
             react_mode_enable=True,
@@ -118,3 +144,82 @@ async def test_boundary_error_does_not_inject_unbounded_history() -> None:
     assert req.prompt == "原始提示词"
     assert "不应注入的消息" not in req.prompt
     assert event.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_auto_attach_recent_images_when_caption_disabled() -> None:
+    plugin, _cfg = _build_plugin(
+        image_caption=False,
+        max_attached_images=2,
+    )
+    event = _DummyGroupEvent(message_id="3")
+    origin = event.unified_msg_origin
+    plugin.runtime.session_chats[origin].extend(
+        [
+            "[用户A/100/10:00:00] #msg1: 早先图片 [Image]",
+            "[用户B/200/10:00:01] #msg2: 次新图片 [Image]",
+            "[用户C/300/10:00:02] #msg3: 最新图片 [Image]",
+        ]
+    )
+    plugin.runtime.image_message_registry[origin]["1"] = {
+        "urls": ["https://example.com/img1.png"],
+        "captions": {},
+    }
+    plugin.runtime.image_message_registry[origin]["2"] = {
+        "urls": ["https://example.com/img2.png"],
+        "captions": {},
+    }
+    plugin.runtime.image_message_registry[origin]["3"] = {
+        "urls": ["https://example.com/img3.png"],
+        "captions": {},
+    }
+
+    async def fake_resolve(ref: str) -> str:
+        return f"/local/{ref.split('/')[-1]}"
+
+    plugin._resolve_image_ref_to_local_path = fake_resolve
+
+    req = ProviderRequest(prompt="最新图片 [Image]", contexts=[])
+    await plugin.inject_group_context(event, req)
+
+    # 应该只挂载最新的 2 张（img2, img3）
+    assert req.image_urls == ["/local/img2.png", "/local/img3.png"]
+    # 在注入的 prompt 中，早先图片依然是 [Image]，次新和最新标记为已挂载
+    assert "早先图片 [Image]" in req.prompt
+    assert "[Image: 原图已挂载#1]" in req.prompt
+    assert "[Image: 原图已挂载#2]" in req.prompt
+
+
+@pytest.mark.asyncio
+async def test_no_auto_attach_when_caption_enabled() -> None:
+    plugin, _cfg = _build_plugin(
+        image_caption=True,
+        image_caption_provider_id="caption-provider",
+        max_attached_images=3,
+    )
+    event = _DummyGroupEvent(message_id="2")
+    origin = event.unified_msg_origin
+    plugin.runtime.session_chats[origin].extend(
+        [
+            "[用户A/100/10:00:00] #msg1: 图片1 [Image]",
+            "[用户B/200/10:00:01] #msg2: 图片2 [Image]",
+        ]
+    )
+    plugin.runtime.image_message_registry[origin]["1"] = {
+        "urls": ["https://example.com/img1.png"],
+        "captions": {},
+    }
+    plugin.runtime.image_message_registry[origin]["2"] = {
+        "urls": ["https://example.com/img2.png"],
+        "captions": {},
+    }
+
+    req = ProviderRequest(prompt="图片2 [Image]", contexts=[])
+    await plugin.inject_group_context(event, req)
+
+    # 转述模式下，不会自动挂载原图到 req.image_urls
+    assert req.image_urls is None or req.image_urls == []
+    # 历史消息中的 [Image] 保持占位符原样
+    assert "原图已挂载" not in req.prompt
+    assert "图片1 [Image]" in req.prompt
+

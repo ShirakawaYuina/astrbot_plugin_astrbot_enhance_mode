@@ -82,6 +82,7 @@ class GroupHistoryEnhancementConfig:
     image_caption: bool = False
     image_caption_provider_id: str = ""
     image_caption_prompt: str = "Please describe the image using Chinese."
+    max_attached_images: int = 3
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,9 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         image_caption_prompt=str(
             group_history_raw.get("image_caption_prompt")
             or "Please describe the image using Chinese."
+        ),
+        max_attached_images=max(
+            0, _to_int(group_history_raw.get("max_attached_images"), 3)
         ),
     )
 

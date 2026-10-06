@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from mcp import types as mcp_types
 import pytest
@@ -20,11 +21,34 @@ class _DummyEvent:
         self.unified_msg_origin = origin
 
 
-def _build_plugin(*, image_caption: bool) -> tuple[Main, _DummyEvent]:
+class _DummyProvider:
+    def __init__(self, modalities: list[str] | None = None) -> None:
+        self.provider_config = {"modalities": modalities} if modalities is not None else {}
+
+
+class _DummyContext:
+    def __init__(self, provider: Any = None) -> None:
+        self._provider = provider or _DummyProvider(["image"])
+
+    def get_using_provider(self, *args: Any, **kwargs: Any) -> Any:
+        return self._provider
+
+
+def _build_plugin(
+    *,
+    image_caption: bool,
+    image_caption_provider_id: str = "caption-provider",
+    modalities: list[str] | None = None,
+) -> tuple[Main, _DummyEvent]:
     plugin = Main.__new__(Main)
     plugin.runtime = RuntimeState()
+    plugin.context = _DummyContext(_DummyProvider(modalities if modalities is not None else ["image"]))
     cfg = PluginConfig(
-        group_history=GroupHistoryEnhancementConfig(enable=True, image_caption=image_caption),
+        group_history=GroupHistoryEnhancementConfig(
+            enable=True,
+            image_caption=image_caption,
+            image_caption_provider_id=image_caption_provider_id if image_caption else "",
+        ),
         group_features=GroupFeatureEnhancementConfig(react_mode_enable=True),
         global_settings=GlobalSettingsConfig(),
     )
@@ -39,11 +63,11 @@ def _payload_from_results(
 
 
 @pytest.mark.asyncio
-async def test_use_image_attach_only_works_without_caption_enabled() -> None:
+async def test_use_image_caption_disabled_attaches_image_without_calling_caption() -> None:
     plugin, event = _build_plugin(image_caption=False)
 
-    async def should_not_be_called(*args, **kwargs):  # noqa: ANN002, ANN003
-        raise AssertionError("_get_image_caption should not be called in attach-only mode")
+    async def should_not_be_called(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("_get_image_caption should not be called when caption is disabled")
 
     async def resolve_local_path(_image_ref: str) -> str:
         return "/tmp/fake-image.png"
@@ -62,9 +86,6 @@ async def test_use_image_attach_only_works_without_caption_enabled() -> None:
         event=event,
         message_id="123",
         image_index=1,
-        attach_to_model=True,
-        write_to_history=False,
-        prompt="ignored",
     ):
         results.append(item)
 
@@ -74,71 +95,24 @@ async def test_use_image_attach_only_works_without_caption_enabled() -> None:
     assert image_content.mimeType == "image/png"
     assert image_content.data == "ZmFrZQ=="
     payload = _payload_from_results(results)
-    assert payload["success"] is True
-    assert payload["attach_requested"] is True
+    assert payload["status"] == "ok"
+    assert payload["mode"] == "attach_image"
     assert payload["attach_success"] is True
-    assert payload["write_to_history_requested"] is False
 
 
 @pytest.mark.asyncio
-async def test_use_image_default_mode_attaches_and_writes_history() -> None:
+async def test_use_image_caption_enabled_writes_history_without_attaching_image() -> None:
     plugin, event = _build_plugin(image_caption=True)
     applied: dict[str, object] = {}
 
-    async def get_image_caption(*args, **kwargs):  # noqa: ANN002, ANN003
+    async def get_image_caption(*args: Any, **kwargs: Any) -> str:
         return "A test caption"
 
-    async def resolve_local_path(_image_ref: str) -> str:
-        return "/tmp/fake-image.png"
-
-    def apply_caption_to_history(**kwargs) -> bool:  # noqa: ANN003
-        applied.update(kwargs)
-        return True
-
-    plugin._get_image_caption = get_image_caption
-    plugin._resolve_image_ref_to_local_path = resolve_local_path
-    plugin._encode_image_file = lambda _path: ("ZmFrZQ==", "image/png")
-    plugin._apply_image_caption_to_history = apply_caption_to_history
-
-    plugin.runtime.image_message_registry[event.unified_msg_origin]["123"] = {
-        "urls": ["https://example.com/image.png"],
-        "captions": {},
-    }
-
-    results = []
-    async for item in plugin.use_image(event=event, message_id="123", image_index=1):
-        results.append(item)
-
-    assert len(results) == 2
-    assert isinstance(results[0].content[0], mcp_types.ImageContent)
-    payload = _payload_from_results(results)
-    assert payload["success"] is True
-    assert payload["attach_success"] is True
-    assert payload["write_to_history_success"] is True
-    assert payload["description_cached"] is False
-    assert (
-        plugin.runtime.image_message_registry[event.unified_msg_origin]["123"]["captions"][0]
-        == "A test caption"
-    )
-    assert applied["message_id"] == "123"
-    assert applied["image_index"] == 0
-    assert applied["caption"] == "A test caption"
-
-
-@pytest.mark.asyncio
-async def test_use_image_history_only_mode_does_not_attach_image() -> None:
-    plugin, event = _build_plugin(image_caption=True)
-    applied = {"count": 0}
-
-    async def get_image_caption(*args, **kwargs):  # noqa: ANN002, ANN003
-        return "History only caption"
-
     async def should_not_resolve(_image_ref: str) -> str:
-        raise AssertionError("_resolve_image_ref_to_local_path should not be called")
+        raise AssertionError("_resolve_image_ref_to_local_path should not be called in caption mode")
 
-    def apply_caption_to_history(**kwargs) -> bool:  # noqa: ANN003
-        _ = kwargs
-        applied["count"] += 1
+    def apply_caption_to_history(**kwargs: Any) -> bool:
+        applied.update(kwargs)
         return True
 
     plugin._get_image_caption = get_image_caption
@@ -151,47 +125,49 @@ async def test_use_image_history_only_mode_does_not_attach_image() -> None:
     }
 
     results = []
-    async for item in plugin.use_image(
-        event=event,
-        message_id="123",
-        image_index=1,
-        attach_to_model=False,
-        write_to_history=True,
-    ):
+    async for item in plugin.use_image(event=event, message_id="123", image_index=1):
         results.append(item)
 
+    # 仅返回文本 payload，不 yield ImageContent
     assert len(results) == 1
+    assert isinstance(results[0].content[0], mcp_types.TextContent)
     payload = _payload_from_results(results)
-    assert payload["success"] is True
-    assert payload["attach_requested"] is False
+    assert payload["status"] == "ok"
+    assert payload["mode"] == "caption"
+    assert payload["description"] == "A test caption"
     assert payload["write_to_history_success"] is True
-    assert applied["count"] == 1
+    assert (
+        plugin.runtime.image_message_registry[event.unified_msg_origin]["123"]["captions"][0]
+        == "A test caption"
+    )
+    assert applied["message_id"] == "123"
+    assert applied["image_index"] == 0
+    assert applied["caption"] == "A test caption"
 
 
 @pytest.mark.asyncio
-async def test_use_image_rejects_both_modes_disabled() -> None:
-    plugin, event = _build_plugin(image_caption=True)
+async def test_use_image_caption_disabled_fails_when_model_does_not_support_image() -> None:
+    plugin, event = _build_plugin(image_caption=False, modalities=["text"])
+    plugin.runtime.image_message_registry[event.unified_msg_origin]["123"] = {
+        "urls": ["https://example.com/image.png"],
+        "captions": {},
+    }
 
     results = []
     async for item in plugin.use_image(
         event=event,
         message_id="123",
         image_index=1,
-        attach_to_model=False,
-        write_to_history=False,
     ):
         results.append(item)
 
     assert len(results) == 1
-    assert (
-        results[0].content[0].text
-        == "Invalid mode: `attach_to_model` and `write_to_history` cannot both be false."
-    )
+    assert "当前对话模型不支持图像输入" in results[0].content[0].text
 
 
 @pytest.mark.asyncio
 async def test_use_image_returns_not_found_when_message_id_is_missing() -> None:
-    plugin, event = _build_plugin(image_caption=True)
+    plugin, event = _build_plugin(image_caption=False)
 
     results = []
     async for item in plugin.use_image(event=event, message_id="not-exist", image_index=1):
@@ -203,7 +179,7 @@ async def test_use_image_returns_not_found_when_message_id_is_missing() -> None:
 
 @pytest.mark.asyncio
 async def test_use_image_returns_error_when_image_index_out_of_range() -> None:
-    plugin, event = _build_plugin(image_caption=True)
+    plugin, event = _build_plugin(image_caption=False)
     plugin.runtime.image_message_registry[event.unified_msg_origin]["123"] = {
         "urls": ["https://example.com/image.png"],
         "captions": {},
@@ -215,28 +191,3 @@ async def test_use_image_returns_error_when_image_index_out_of_range() -> None:
 
     assert len(results) == 1
     assert "`image_index` out of range" in results[0].content[0].text
-
-
-@pytest.mark.asyncio
-async def test_use_image_history_only_fails_when_caption_disabled_and_not_cached() -> None:
-    plugin, event = _build_plugin(image_caption=False)
-    plugin.runtime.image_message_registry[event.unified_msg_origin]["123"] = {
-        "urls": ["https://example.com/image.png"],
-        "captions": {},
-    }
-
-    results = []
-    async for item in plugin.use_image(
-        event=event,
-        message_id="123",
-        image_index=1,
-        attach_to_model=False,
-        write_to_history=True,
-    ):
-        results.append(item)
-
-    assert len(results) == 1
-    assert (
-        results[0].content[0].text
-        == "Image caption is disabled in enhance mode config."
-    )

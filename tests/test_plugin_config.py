@@ -8,6 +8,7 @@ from astrbot_plugin_astrbot_enhance_mode.plugin_config import parse_plugin_confi
 def test_parse_plugin_config_defaults() -> None:
     cfg = parse_plugin_config(None)
     assert cfg.group_history.enable is False
+    assert cfg.group_history.max_attached_images == 3
     assert cfg.active_reply.enable is False
     assert cfg.active_reply.mode == "probability"
     assert cfg.active_reply.model_choice_provider_id == ""
@@ -18,6 +19,13 @@ def test_parse_plugin_config_defaults() -> None:
     assert cfg.web_search.base_url_override == ""
     assert cfg.browser_tool.command == "agent-browser"
     assert cfg.browser_tool.persist_session is True
+
+
+def test_group_history_max_attached_images_normalized() -> None:
+    cfg_neg = parse_plugin_config({"group_history_enhancement": {"max_attached_images": -5}})
+    assert cfg_neg.group_history.max_attached_images == 0
+    cfg_pos = parse_plugin_config({"group_history_enhancement": {"max_attached_images": 5}})
+    assert cfg_pos.group_history.max_attached_images == 5
 
 
 def test_probability_is_clamped_and_nan_falls_back() -> None:
