@@ -7,6 +7,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import time
 import traceback
 import uuid
@@ -84,6 +85,51 @@ class Main(star.Star):
             self.memory_rag_store is not None,
             self._display_timezone,
         )
+
+    @property
+    def image_cache_dir(self) -> Path:
+        cache_dir = getattr(self, "_image_cache_dir", None)
+        if cache_dir is None:
+            try:
+                base_dir = (
+                    Path(get_astrbot_data_path())
+                    / "plugin_data"
+                    / "astrbot_plugin_astrbot_enhance_mode"
+                )
+            except Exception:
+                base_dir = Path("/tmp/astrbot_plugin_enhance_mode")
+            cache_dir = base_dir / "cached_images"
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            self._image_cache_dir = cache_dir
+        return cache_dir
+
+    def _persist_image_file(
+        self, source_path: str, origin: str, message_id: str, index: int
+    ) -> str:
+        """将临时图片复制到插件自己的持久缓存目录中，避免被 AstrBot 的事件生命周期清理掉。"""
+        src = Path(source_path)
+        if not src.is_file():
+            return ""
+        try:
+            cache_dir = self.image_cache_dir
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            suffix = src.suffix or ".jpg"
+            safe_origin = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(origin))
+            filename = f"{safe_origin}_{message_id}_{index}{suffix}"
+            dest = cache_dir / filename
+            if src.resolve() != dest.resolve():
+                shutil.copy2(src, dest)
+            return str(dest.resolve())
+        except Exception as exc:
+            logger.warning(
+                "enhance-mode | persist_image_file failed for %s: %s",
+                source_path,
+                exc,
+            )
+            return str(src.resolve()) if src.is_file() else ""
 
     def _cfg(self) -> PluginConfig:
         return parse_plugin_config(self.config)
@@ -215,7 +261,9 @@ class Main(star.Star):
             return True
         return False
 
-    async def _resolve_image_ref_to_local_path(self, image_ref: str) -> str:
+    async def _resolve_image_ref_to_local_path(
+        self, image_ref: str, event: AstrMessageEvent | None = None
+    ) -> str:
         clean_ref = str(image_ref or "").strip()
         if not clean_ref:
             return ""
@@ -225,11 +273,79 @@ class Main(star.Star):
 
         candidate = Path(clean_ref)
         if candidate.exists() and candidate.is_file():
-            return str(candidate)
+            return str(candidate.resolve())
 
+        is_abs_or_file_path = clean_ref.startswith(("/", "\\")) or (len(clean_ref) > 2 and clean_ref[1] == ":")
+        if is_abs_or_file_path:
+            # 如果是本地文件路径且文件已不存在，说明是已失效的旧临时文件，直接返回空，避免将其当做 OneBot ID 尝试 16 次报错
+            return ""
+
+        # 1. 尝试使用 AstrBot 官方 MediaResolver 解析（支持 http、base64、data URI、file URI 等）
+        try:
+            from astrbot.core.utils.media_utils import MediaResolver
+            resolved = await MediaResolver(clean_ref, media_type="image").to_path()
+            if resolved and Path(resolved).is_file():
+                return str(Path(resolved).resolve())
+        except Exception as exc:
+            logger.debug("enhance-mode | MediaResolver failed for ref %s: %s", clean_ref[:60], exc)
+
+        # 2. 尝试使用 download_image_by_url 下载
         if clean_ref.startswith("http://") or clean_ref.startswith("https://"):
-            downloaded = await download_image_by_url(clean_ref)
-            return str(downloaded or "")
+            try:
+                downloaded = await download_image_by_url(clean_ref)
+                if downloaded and Path(downloaded).is_file():
+                    return str(Path(downloaded).resolve())
+            except Exception as exc:
+                logger.warning("enhance-mode | download_image_by_url failed for %s: %s", clean_ref[:60], exc)
+
+        # 3. 尝试通过 AstrBot 核心 ImageResolver / OneBot 协议客户端提取真实图片
+        if event is not None:
+            # 3a. 优先使用 AstrBot 核心 ImageResolver
+            try:
+                from astrbot.core.utils.quoted_message.image_resolver import ImageResolver
+                core_resolver = ImageResolver(event)
+                resolved_refs = await core_resolver.resolve_for_llm([clean_ref])
+                for r_ref in resolved_refs:
+                    if r_ref and r_ref != clean_ref:
+                        sub_path = await self._resolve_image_ref_to_local_path(r_ref, event=None)
+                        if sub_path and Path(sub_path).is_file():
+                            return sub_path
+            except Exception as exc:
+                logger.debug("enhance-mode | core ImageResolver failed: %s", exc)
+
+            # 3b. Fallback: 直接调用 event.bot / event.bot.api 的 call_action
+            call_action = None
+            bot = getattr(event, "bot", None)
+            if bot is not None:
+                if callable(getattr(bot, "call_action", None)):
+                    call_action = bot.call_action
+                elif callable(getattr(getattr(bot, "api", None), "call_action", None)):
+                    call_action = bot.api.call_action
+
+            if call_action is not None:
+                try:
+                    candidates = [clean_ref]
+                    base_name, _ = os.path.splitext(clean_ref)
+                    if base_name and base_name not in candidates:
+                        candidates.append(base_name)
+
+                    for cand in candidates:
+                        for action in ["get_image", "get_file"]:
+                            for key in ["file", "file_id", "id", "image"]:
+                                try:
+                                    ret = await call_action(action, **{key: cand})
+                                    if isinstance(ret, dict):
+                                        data_field = ret.get("data")
+                                        unwrapped = data_field if isinstance(data_field, dict) else ret
+                                        target = unwrapped.get("file") or unwrapped.get("url")
+                                        if target and target != clean_ref:
+                                            sub_res = await self._resolve_image_ref_to_local_path(str(target), event=None)
+                                            if sub_res and Path(sub_res).is_file():
+                                                return sub_res
+                                except Exception:
+                                    continue
+                except Exception as exc:
+                    logger.debug("enhance-mode | OneBot API failed: %s", exc)
 
         return ""
 
@@ -1874,6 +1990,7 @@ class Main(star.Star):
         msg_id = event.message_obj.message_id
         normalized_msg_id = self._normalize_message_id(msg_id)
         image_urls: list[str] = []
+        resolved_paths: list[str] = []
 
         # 引用格式化需要检查目标原消息是否仍在本会话历史中，因此先取得当前会话容器。
         self._touch_origin(event.unified_msg_origin, cfg)
@@ -1913,8 +2030,42 @@ class Main(star.Star):
             elif isinstance(comp, Plain):
                 parts.append(f" {comp.text}")
             elif isinstance(comp, Image):
-                image_url = str(comp.url or comp.file or "").strip()
-                image_urls.append(image_url)
+                local_path = ""
+                # 1. 优先尝试 AstrBot Image 组件的异步 convert_to_file_path() 固化到本地临时文件
+                try:
+                    if hasattr(comp, "convert_to_file_path") and callable(comp.convert_to_file_path):
+                        cand_path = await comp.convert_to_file_path()
+                        if cand_path and Path(cand_path).is_file():
+                            local_path = str(Path(cand_path).resolve())
+                except Exception as exc:
+                    logger.debug("enhance-mode | convert_to_file_path failed: %s", exc)
+
+                # 2. 提取原始引用 (保留 OneBot 文件 ID 或远程 URL，作为后续重试依据)
+                raw_ref = str(getattr(comp, "path", "") or getattr(comp, "url", "") or getattr(comp, "file", "") or "").strip()
+
+                # 3. 若尚未是有效本地文件，通过 _resolve_image_ref_to_local_path 解析
+                if not local_path and raw_ref:
+                    try:
+                        local_path = await self._resolve_image_ref_to_local_path(raw_ref, event)
+                    except TypeError:
+                        local_path = await self._resolve_image_ref_to_local_path(raw_ref)
+
+                # 4. 如果得到了本地文件，立即复制固化到插件自己的持久缓存目录，防止 AstrBot 事件生命周期清理
+                if local_path and Path(local_path).is_file():
+                    idx = len(image_urls)
+                    persistent_path = self._persist_image_file(
+                        local_path,
+                        origin=event.unified_msg_origin,
+                        message_id=normalized_msg_id or msg_id,
+                        index=idx,
+                    )
+                    if persistent_path:
+                        local_path = persistent_path
+
+                raw_ref_to_store = raw_ref or local_path
+                if raw_ref_to_store or local_path:
+                    image_urls.append(raw_ref_to_store)
+                    resolved_paths.append(local_path)
                 parts.append(" [Image]")
             elif isinstance(comp, At):
                 parts.append(f" [At: {comp.name}]")
@@ -1927,19 +2078,31 @@ class Main(star.Star):
             removed_line = chats.pop(0)
             removed_msg_id = self._extract_message_id_from_history_line(removed_line)
             if removed_msg_id:
-                self.runtime.image_message_registry[event.unified_msg_origin].pop(
+                evicted = self.runtime.image_message_registry[event.unified_msg_origin].pop(
                     removed_msg_id, None
                 )
+                if evicted and isinstance(evicted.get("resolved_paths"), list):
+                    for path_str in evicted["resolved_paths"]:
+                        if path_str and Path(path_str).is_file():
+                            try:
+                                if str(path_str).startswith(str(self.image_cache_dir)):
+                                    Path(path_str).unlink(missing_ok=True)
+                            except Exception:
+                                pass
         if normalized_msg_id and image_urls:
             self.runtime.image_message_registry[event.unified_msg_origin][
                 normalized_msg_id
-            ] = {"urls": image_urls, "captions": {}}
-            logger.debug(
-                "enhance-mode | image message registered | origin=%s msg_id=%s image_count=%s deferred_caption=%s",
+            ] = {
+                "urls": image_urls,
+                "resolved_paths": resolved_paths,
+                "captions": {},
+            }
+            logger.info(
+                "enhance-mode | image message registered | origin=%s msg_id=%s count=%s resolved=%s",
                 event.unified_msg_origin,
                 normalized_msg_id,
                 len(image_urls),
-                history_cfg.image_caption,
+                [p for p in resolved_paths if p],
             )
         logger.debug(
             "enhance-mode | group history updated | origin=%s size=%s",
@@ -1990,7 +2153,7 @@ class Main(star.Star):
         if not is_caption_mode and supports_image and cfg.group_history.max_attached_images > 0:
             origin = event.unified_msg_origin
             registry = self.runtime.image_message_registry.get(origin, {})
-            collected_images: list[tuple[str, int, str]] = []
+            collected_images: list[tuple[str, int, str, str]] = []
             max_attach = cfg.group_history.max_attached_images
             for line in reversed(history_boundary.history_through_current):
                 msg_id = extract_message_id_from_history_line(line)
@@ -2000,11 +2163,17 @@ class Main(star.Star):
                 urls = entry.get("urls")
                 if not isinstance(urls, list) or not urls:
                     continue
+                resolved_paths_list = entry.get("resolved_paths")
+                if not isinstance(resolved_paths_list, list) or len(resolved_paths_list) != len(urls):
+                    resolved_paths_list = [""] * len(urls)
+                    entry["resolved_paths"] = resolved_paths_list
+
                 for idx in range(len(urls) - 1, -1, -1):
-                    url = str(urls[idx] or "").strip()
-                    if not url:
+                    cached_path = str(resolved_paths_list[idx] or "").strip()
+                    fallback_ref = str(urls[idx] or "").strip()
+                    if not cached_path and not fallback_ref:
                         continue
-                    collected_images.append((msg_id, idx, url))
+                    collected_images.append((msg_id, idx, cached_path, fallback_ref))
                     if len(collected_images) >= max_attach:
                         break
                 if len(collected_images) >= max_attach:
@@ -2014,13 +2183,66 @@ class Main(star.Star):
             if req.image_urls is None:
                 req.image_urls = []
 
-            for seq, (msg_id, idx, img_ref) in enumerate(collected_images, 1):
-                attached_seq_map[(msg_id, idx)] = seq
-                local_path = await self._resolve_image_ref_to_local_path(img_ref)
-                img_to_attach = local_path or img_ref
-                if img_to_attach and img_to_attach not in req.image_urls:
-                    req.image_urls.append(img_to_attach)
-            attached_count = len(collected_images)
+            for msg_id, idx, cached_path, fallback_ref in collected_images:
+                local_path = ""
+                # 1. 优先使用已持久化固化的本地文件
+                if cached_path and (Path(cached_path).is_file() or cached_path.startswith("/local/")):
+                    local_path = cached_path
+                else:
+                    # 2. 如果持久化文件丢失，尝试使用 fallback_ref（原始 OneBot ID 或 URL）重新解析
+                    cand_ref = fallback_ref or cached_path
+                    if cand_ref:
+                        try:
+                            local_path = await self._resolve_image_ref_to_local_path(cand_ref, event)
+                        except TypeError:
+                            local_path = await self._resolve_image_ref_to_local_path(cand_ref)
+                        if local_path and Path(local_path).is_file():
+                            persisted = self._persist_image_file(local_path, origin, msg_id, idx)
+                            if persisted:
+                                local_path = persisted
+
+                if local_path:
+                    entry = registry.get(msg_id)
+                    if entry and isinstance(entry.get("resolved_paths"), list) and idx < len(entry["resolved_paths"]):
+                        entry["resolved_paths"][idx] = local_path
+
+                    if local_path not in req.image_urls:
+                        req.image_urls.append(local_path)
+                    seq = len(req.image_urls)
+                    attached_seq_map[(msg_id, idx)] = seq
+                else:
+                    logger.warning(
+                        "enhance-mode | inject_group_context: unable to resolve image ref: origin=%s msg_id=%s idx=%s cached=%s fallback=%s",
+                        origin,
+                        msg_id,
+                        idx,
+                        cached_path[:50],
+                        fallback_ref[:50],
+                    )
+
+            if req.image_urls:
+                sanitized_urls: list[str] = []
+                for item in req.image_urls:
+                    clean_item = str(item or "").strip()
+                    if not clean_item:
+                        continue
+                    if Path(clean_item).is_file() or clean_item.startswith(("http://", "https://", "data:", "base64:")) or clean_item.startswith("/local/"):
+                        sanitized_urls.append(clean_item)
+                    else:
+                        try:
+                            resolved_cand = await self._resolve_image_ref_to_local_path(clean_item, event)
+                        except TypeError:
+                            resolved_cand = await self._resolve_image_ref_to_local_path(clean_item)
+                        if resolved_cand:
+                            sanitized_urls.append(resolved_cand)
+                        else:
+                            logger.warning(
+                                "enhance-mode | pruned unresolvable image_url from req: %s",
+                                clean_item[:60],
+                            )
+                req.image_urls = sanitized_urls
+
+            attached_count = len(attached_seq_map)
 
         def _format_history_line(line: str) -> str:
             if not attached_seq_map:
@@ -2806,18 +3028,41 @@ class Main(star.Star):
             resolved_paths_raw = [""] * len(urls_raw)
             message_entry["resolved_paths"] = resolved_paths_raw
 
-        selected_ref = str(
-            resolved_paths_raw[image_idx] or urls_raw[image_idx] or ""
-        ).strip()
-        if not selected_ref:
+        cached_path = str(resolved_paths_raw[image_idx] or "").strip()
+        fallback_ref = str(urls_raw[image_idx] or "").strip()
+        if not cached_path and not fallback_ref:
             yield self._make_text_tool_result(
                 f"Image reference is unavailable for message `{normalized_message_id}` at index {index_number}."
             )
             return
 
         try:
-            local_path = await self._resolve_image_ref_to_local_path(selected_ref)
-            if not local_path:
+            local_path = ""
+            if cached_path and (Path(cached_path).is_file() or cached_path.startswith(("/tmp/", "/local/"))):
+                local_path = cached_path
+            else:
+                cand_ref = fallback_ref or cached_path
+                try:
+                    local_path = await self._resolve_image_ref_to_local_path(cand_ref, event)
+                except TypeError:
+                    local_path = await self._resolve_image_ref_to_local_path(cand_ref)
+
+                if local_path and Path(local_path).is_file():
+                    persisted = self._persist_image_file(
+                        local_path, origin, normalized_message_id, image_idx
+                    )
+                    if persisted:
+                        local_path = persisted
+
+            if not local_path or not (Path(local_path).is_file() or local_path.startswith(("/tmp/", "/local/"))):
+                logger.warning(
+                    "enhance-mode | use_image failed to resolve image path: origin=%s msg_id=%s idx=%s cached=%s fallback=%s",
+                    origin,
+                    normalized_message_id,
+                    index_number,
+                    cached_path[:50],
+                    fallback_ref[:50],
+                )
                 yield self._make_text_tool_result(
                     f"Failed to resolve image path for message `{normalized_message_id}` index {index_number}."
                 )
