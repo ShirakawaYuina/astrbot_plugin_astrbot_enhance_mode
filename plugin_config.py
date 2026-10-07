@@ -83,6 +83,9 @@ class GroupHistoryEnhancementConfig:
     image_caption_provider_id: str = ""
     image_caption_prompt: str = "Please describe the image using Chinese."
     max_attached_images: int = 3
+    attached_images_scan_messages: int = 10
+    filter_memes: bool = True
+    meme_max_dimension: int = 400
 
 
 @dataclass(frozen=True)
@@ -229,6 +232,14 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         ),
         max_attached_images=max(
             0, _to_int(group_history_raw.get("max_attached_images"), 3)
+        ),
+        attached_images_scan_messages=max(
+            0,
+            _to_int(group_history_raw.get("attached_images_scan_messages"), 10),
+        ),
+        filter_memes=_to_bool(group_history_raw.get("filter_memes"), True),
+        meme_max_dimension=max(
+            0, _to_int(group_history_raw.get("meme_max_dimension"), 400)
         ),
     )
 

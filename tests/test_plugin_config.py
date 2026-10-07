@@ -9,6 +9,9 @@ def test_parse_plugin_config_defaults() -> None:
     cfg = parse_plugin_config(None)
     assert cfg.group_history.enable is False
     assert cfg.group_history.max_attached_images == 3
+    assert cfg.group_history.attached_images_scan_messages == 10
+    assert cfg.group_history.filter_memes is True
+    assert cfg.group_history.meme_max_dimension == 400
     assert cfg.active_reply.enable is False
     assert cfg.active_reply.mode == "probability"
     assert cfg.active_reply.model_choice_provider_id == ""
@@ -26,6 +29,30 @@ def test_group_history_max_attached_images_normalized() -> None:
     assert cfg_neg.group_history.max_attached_images == 0
     cfg_pos = parse_plugin_config({"group_history_enhancement": {"max_attached_images": 5}})
     assert cfg_pos.group_history.max_attached_images == 5
+
+
+def test_group_history_attached_images_scan_messages_normalized() -> None:
+    cfg_neg = parse_plugin_config(
+        {"group_history_enhancement": {"attached_images_scan_messages": -10}}
+    )
+    assert cfg_neg.group_history.attached_images_scan_messages == 0
+    cfg_pos = parse_plugin_config(
+        {"group_history_enhancement": {"attached_images_scan_messages": 20}}
+    )
+    assert cfg_pos.group_history.attached_images_scan_messages == 20
+
+
+def test_group_history_meme_filter_config_normalized() -> None:
+    cfg_off = parse_plugin_config(
+        {"group_history_enhancement": {"filter_memes": False, "meme_max_dimension": -100}}
+    )
+    assert cfg_off.group_history.filter_memes is False
+    assert cfg_off.group_history.meme_max_dimension == 0
+    cfg_on = parse_plugin_config(
+        {"group_history_enhancement": {"filter_memes": True, "meme_max_dimension": 500}}
+    )
+    assert cfg_on.group_history.filter_memes is True
+    assert cfg_on.group_history.meme_max_dimension == 500
 
 
 def test_probability_is_clamped_and_nan_falls_back() -> None:

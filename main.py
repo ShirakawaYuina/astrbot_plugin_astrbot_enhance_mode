@@ -53,7 +53,7 @@ from .tag_utils import (
 )
 from .webui import RAGWebUIServer
 
-IMAGE_MARKER_PATTERN = re.compile(r"\[Image(?:: [^\]]*)?\]")
+IMAGE_MARKER_PATTERN = re.compile(r"\[(?:Image|Meme)(?:: [^\]]*)?\]")
 
 
 class Main(star.Star):
@@ -197,10 +197,87 @@ class Main(star.Star):
             if idx < 0 or idx >= len(matches):
                 continue
             target = matches[idx]
+            marker_text = target.group(0)
+            prefix = "[Meme" if marker_text.startswith("[Meme") else "[Image"
             safe_text = str(replacements[idx] or "").strip().replace("]", ")")
-            replacement = f"[Image: {safe_text}]"
+            replacement = f"{prefix}: {safe_text}]"
             res = res[: target.start()] + replacement + res[target.end() :]
         return res
+
+    @classmethod
+    def _is_meme_image(
+        cls,
+        comp: Any,
+        local_path: str,
+        event: AstrMessageEvent,
+        cfg: PluginConfig,
+        comp_index: int = 0,
+    ) -> bool:
+        # 1. 优先检查 NapCat / OneBot 协议层原始元数据 (subType, summary)
+        try:
+            raw_message = getattr(event.message_obj, "raw_message", None)
+            if isinstance(raw_message, dict) and isinstance(raw_message.get("message"), list):
+                img_segs = [
+                    seg.get("data")
+                    for seg in raw_message["message"]
+                    if isinstance(seg, dict)
+                    and seg.get("type") == "image"
+                    and isinstance(seg.get("data"), dict)
+                ]
+                target_seg = None
+                comp_file = str(
+                    getattr(comp, "file", "")
+                    or getattr(comp, "url", "")
+                    or getattr(comp, "path", "")
+                    or ""
+                ).strip()
+                if comp_file:
+                    for s in img_segs:
+                        s_file = str(s.get("file") or s.get("url") or "").strip()
+                        if s_file and (s_file in comp_file or comp_file in s_file):
+                            target_seg = s
+                            break
+                if target_seg is None and 0 <= comp_index < len(img_segs):
+                    target_seg = img_segs[comp_index]
+
+                if target_seg:
+                    sub_type = str(
+                        target_seg.get("subType")
+                        or target_seg.get("sub_type")
+                        or ""
+                    ).strip()
+                    # NapCat: 1=表情包/自定义表情, 2=热图, 3=斗图, 4=贴纸
+                    if sub_type in {"1", "2", "3", "4"}:
+                        return True
+                    summary = str(target_seg.get("summary") or "").strip()
+                    if "[动画表情]" in summary or "[表情]" in summary:
+                        return True
+        except Exception as e:
+            logger.debug("enhance-mode | _is_meme_image raw protocol check error: %s", e)
+
+        # 2. 检查本地图片文件特征 (动态图格式、分辨率尺寸及长宽比)
+        if str(local_path or "").lower().endswith(".gif"):
+            return True
+        if local_path and Path(local_path).is_file():
+            try:
+                from PIL import Image as PILImage
+
+                with PILImage.open(local_path) as pil_img:
+                    fmt = str(pil_img.format or "").upper()
+                    if fmt == "GIF" or getattr(pil_img, "is_animated", False):
+                        return True
+                    threshold = cfg.group_history.meme_max_dimension
+                    if threshold > 0:
+                        w, h = pil_img.size
+                        if max(w, h) <= threshold:
+                            ratio = (w / h) if h > 0 else 1.0
+                            # 表情包通常尺寸较小且长宽比接近正方形，避免误判细条形截图
+                            if 0.4 <= ratio <= 2.5:
+                                return True
+            except Exception as e:
+                logger.debug("enhance-mode | _is_meme_image pil check error: %s", e)
+
+        return False
 
     @staticmethod
     def _is_image_caption_mode(cfg: PluginConfig) -> bool:
@@ -232,8 +309,10 @@ class Main(star.Star):
             return line, False
 
         target = matches[image_index]
+        marker_text = target.group(0)
+        prefix = "[Meme" if marker_text.startswith("[Meme") else "[Image"
         safe_caption = str(caption or "").strip().replace("]", ")")
-        replacement = f"[Image: {safe_caption}]"
+        replacement = f"{prefix}: {safe_caption}]"
         new_line = line[: target.start()] + replacement + line[target.end() :]
         return new_line, new_line != line
 
@@ -1991,6 +2070,7 @@ class Main(star.Star):
         normalized_msg_id = self._normalize_message_id(msg_id)
         image_urls: list[str] = []
         resolved_paths: list[str] = []
+        is_memes: list[bool] = []
 
         # 引用格式化需要检查目标原消息是否仍在本会话历史中，因此先取得当前会话容器。
         self._touch_origin(event.unified_msg_origin, cfg)
@@ -2064,9 +2144,22 @@ class Main(star.Star):
 
                 raw_ref_to_store = raw_ref or local_path
                 if raw_ref_to_store or local_path:
+                    comp_img_idx = len(image_urls)
                     image_urls.append(raw_ref_to_store)
                     resolved_paths.append(local_path)
-                parts.append(" [Image]")
+                    is_meme = False
+                    if history_cfg.filter_memes:
+                        is_meme = self._is_meme_image(
+                            comp=comp,
+                            local_path=local_path,
+                            event=event,
+                            cfg=cfg,
+                            comp_index=comp_img_idx,
+                        )
+                    is_memes.append(is_meme)
+                    parts.append(" [Meme]" if is_meme else " [Image]")
+                else:
+                    parts.append(" [Image]")
             elif isinstance(comp, At):
                 parts.append(f" [At: {comp.name}]")
 
@@ -2095,6 +2188,7 @@ class Main(star.Star):
             ] = {
                 "urls": image_urls,
                 "resolved_paths": resolved_paths,
+                "is_memes": is_memes,
                 "captions": {},
             }
             logger.info(
@@ -2155,7 +2249,13 @@ class Main(star.Star):
             registry = self.runtime.image_message_registry.get(origin, {})
             collected_images: list[tuple[str, int, str, str]] = []
             max_attach = cfg.group_history.max_attached_images
-            for line in reversed(history_boundary.history_through_current):
+            scan_limit = cfg.group_history.attached_images_scan_messages
+            history_to_scan = history_boundary.history_through_current
+            if scan_limit > 0:
+                history_to_scan = history_to_scan[-scan_limit:]
+            elif scan_limit <= 0:
+                history_to_scan = ()
+            for line in reversed(history_to_scan):
                 msg_id = extract_message_id_from_history_line(line)
                 if not msg_id or msg_id not in registry:
                     continue
@@ -2163,12 +2263,18 @@ class Main(star.Star):
                 urls = entry.get("urls")
                 if not isinstance(urls, list) or not urls:
                     continue
+                is_memes = entry.get("is_memes")
+                if not isinstance(is_memes, list) or len(is_memes) != len(urls):
+                    is_memes = [False] * len(urls)
                 resolved_paths_list = entry.get("resolved_paths")
                 if not isinstance(resolved_paths_list, list) or len(resolved_paths_list) != len(urls):
                     resolved_paths_list = [""] * len(urls)
                     entry["resolved_paths"] = resolved_paths_list
 
                 for idx in range(len(urls) - 1, -1, -1):
+                    if cfg.group_history.filter_memes and is_memes[idx]:
+                        # 过滤表情包，不占用 max_attached_images 挂载名额
+                        continue
                     cached_path = str(resolved_paths_list[idx] or "").strip()
                     fallback_ref = str(urls[idx] or "").strip()
                     if not cached_path and not fallback_ref:
@@ -2288,7 +2394,7 @@ class Main(star.Star):
         )
         if is_caption_mode:
             interaction_instructions += (
-                "\nIf a history message contains `[Image]` and you need to understand its content, "
+                "\nIf a history message contains `[Image]` or `[Meme]` and you need to understand its content, "
                 "call `enhance_use_image(message_id, image_index)`. "
                 "The caption model will generate a description and write it back into chat history."
             )
@@ -2298,12 +2404,13 @@ class Main(star.Star):
                     interaction_instructions += (
                         f"\nVisual input: The latest {attached_count} image(s) from history have been directly attached "
                         "to this request (marked as `[Image: 原图已挂载#N]`). Earlier images remain as `[Image]`. "
-                        "If you need to view visual details of earlier images, "
+                        "Memes/stickers are marked as `[Meme]`. "
+                        "If you need to view visual details of earlier images or memes, "
                         "call `enhance_use_image(message_id, image_index)` to attach them."
                     )
                 else:
                     interaction_instructions += (
-                        "\nIf a history message contains `[Image]` and visual details are necessary, "
+                        "\nIf a history message contains `[Image]` or `[Meme]` and visual details are necessary, "
                         "call `enhance_use_image(message_id, image_index)` to attach the image to your context."
                     )
             else:

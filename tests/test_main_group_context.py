@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from astrbot.api.message_components import Image
 from astrbot.api.platform import MessageType
 from astrbot.api.provider import ProviderRequest
 
@@ -62,6 +63,9 @@ def _build_plugin(
     image_caption: bool = False,
     image_caption_provider_id: str = "",
     max_attached_images: int = 3,
+    attached_images_scan_messages: int = 10,
+    filter_memes: bool = True,
+    meme_max_dimension: int = 400,
     modalities: list[str] | None = None,
 ) -> tuple[Main, PluginConfig]:
     plugin = Main.__new__(Main)
@@ -73,6 +77,9 @@ def _build_plugin(
             image_caption=image_caption,
             image_caption_provider_id=image_caption_provider_id,
             max_attached_images=max_attached_images,
+            attached_images_scan_messages=attached_images_scan_messages,
+            filter_memes=filter_memes,
+            meme_max_dimension=meme_max_dimension,
         ),
         active_reply=ActiveReplyConfig(enable=True, mode=active_reply_mode),
         group_features=GroupFeatureEnhancementConfig(
@@ -222,4 +229,155 @@ async def test_no_auto_attach_when_caption_enabled() -> None:
     # 历史消息中的 [Image] 保持占位符原样
     assert "原图已挂载" not in req.prompt
     assert "图片1 [Image]" in req.prompt
+
+
+@pytest.mark.asyncio
+async def test_attached_images_scan_messages_window() -> None:
+    # 模拟历史中有 5 条消息：
+    # msg1 (有图片)
+    # msg2 (纯文字)
+    # msg3 (纯文字)
+    # msg4 (纯文字)
+    # msg5 (当前消息，纯文字)
+    plugin, _ = _build_plugin(
+        image_caption=False,
+        max_attached_images=3,
+        attached_images_scan_messages=3,
+    )
+    event = _DummyGroupEvent(message_id="5")
+    origin = event.unified_msg_origin
+    plugin.runtime.session_chats[origin].extend(
+        [
+            "[用户A/100/10:00:00] #msg1: 旧图片消息 [Image]",
+            "[用户B/200/10:00:01] #msg2: 纯文字2",
+            "[用户C/300/10:00:02] #msg3: 纯文字3",
+            "[用户D/400/10:00:03] #msg4: 纯文字4",
+            "[用户E/500/10:00:04] #msg5: 当前文字5",
+        ]
+    )
+    plugin.runtime.image_message_registry[origin]["1"] = {
+        "urls": ["https://example.com/img1.png"],
+        "captions": {},
+    }
+
+    async def fake_resolve(ref: str) -> str:
+        return f"/local/{ref.split('/')[-1]}"
+
+    plugin._resolve_image_ref_to_local_path = fake_resolve
+
+    req = ProviderRequest(prompt="当前文字5", contexts=[])
+    await plugin.inject_group_context(event, req)
+
+    # 1. 扫描最近 3 条消息（msg3, msg4, msg5），无图片，因此不挂载任何图片
+    assert req.image_urls == []
+    assert "原图已挂载" not in req.prompt
+    # 2. 但是全部 5 条消息依然完整注入 Prompt（历史文本注入不受 scan_messages 影响）
+    assert "旧图片消息 [Image]" in req.prompt
+    assert "纯文字2" in req.prompt
+    assert "纯文字3" in req.prompt
+    assert "纯文字4" in req.prompt
+    assert "当前文字5" in req.prompt
+
+    # 3. 如果把扫描窗口扩大到 5 条（包含 msg1）：
+    plugin2, _ = _build_plugin(
+        image_caption=False,
+        max_attached_images=3,
+        attached_images_scan_messages=5,
+    )
+    plugin2.runtime.session_chats[origin].extend(
+        plugin.runtime.session_chats[origin]
+    )
+    plugin2.runtime.image_message_registry[origin]["1"] = {
+        "urls": ["https://example.com/img1.png"],
+        "captions": {},
+    }
+    plugin2._resolve_image_ref_to_local_path = fake_resolve
+
+    req2 = ProviderRequest(prompt="当前文字5", contexts=[])
+    await plugin2.inject_group_context(event, req2)
+
+    # msg1 处于最近 5 条窗口内，图片被成功挂载
+    assert req2.image_urls == ["/local/img1.png"]
+    assert "[Image: 原图已挂载#1]" in req2.prompt
+
+
+@pytest.mark.asyncio
+async def test_filter_memes_in_history_and_attach() -> None:
+    plugin, _ = _build_plugin(
+        image_caption=False,
+        max_attached_images=2,
+        attached_images_scan_messages=10,
+        filter_memes=True,
+    )
+    event = _DummyGroupEvent(message_id="3")
+    origin = event.unified_msg_origin
+    # 模拟历史：
+    # msg1: 截图 (真实大图，非表情包)
+    # msg2: 表情包 (被标记为 [Meme])
+    # msg3: 当前文本消息
+    plugin.runtime.session_chats[origin].extend(
+        [
+            "[用户A/100/10:00:00] #msg1: 发了张错误截图 [Image]",
+            "[用户B/200/10:00:01] #msg2: 发了个搞笑表情包 [Meme]",
+            "[用户C/300/10:00:02] #msg3: 帮我看下报错",
+        ]
+    )
+    plugin.runtime.image_message_registry[origin]["1"] = {
+        "urls": ["https://example.com/screenshot.png"],
+        "resolved_paths": ["/local/screenshot.png"],
+        "is_memes": [False],
+        "captions": {},
+    }
+    plugin.runtime.image_message_registry[origin]["2"] = {
+        "urls": ["https://example.com/meme.gif"],
+        "resolved_paths": ["/local/meme.gif"],
+        "is_memes": [True],
+        "captions": {},
+    }
+
+    async def fake_resolve(ref: str) -> str:
+        return f"/local/{ref.split('/')[-1]}"
+
+    plugin._resolve_image_ref_to_local_path = fake_resolve
+
+    req = ProviderRequest(prompt="帮我看下报错", contexts=[])
+    await plugin.inject_group_context(event, req)
+
+    # 1. 自动跳过表情包 msg2，只挂载截图 msg1
+    assert req.image_urls == ["/local/screenshot.png"]
+    # 2. 截图替换为 [Image: 原图已挂载#1]，而表情包保持 [Meme] 标记
+    assert "[Image: 原图已挂载#1]" in req.prompt
+    assert "发了个搞笑表情包 [Meme]" in req.prompt
+
+
+def test_is_meme_image_detection() -> None:
+    plugin, cfg = _build_plugin(filter_memes=True, meme_max_dimension=400)
+
+    # 1. NapCat subType = 1 (自定义表情包)
+    event_meme = _DummyGroupEvent(message_id="10")
+    event_meme.message_obj.raw_message = {
+        "message": [{"type": "image", "data": {"file": "meme1.jpg", "subType": "1"}}]
+    }
+    comp_meme = Image(file="meme1.jpg")
+    assert plugin._is_meme_image(comp_meme, "", event_meme, cfg) is True
+
+    # 2. NapCat summary = [动画表情]
+    event_anim = _DummyGroupEvent(message_id="11")
+    event_anim.message_obj.raw_message = {
+        "message": [{"type": "image", "data": {"file": "anim.jpg", "subType": "0", "summary": "[动画表情]"}}]
+    }
+    comp_anim = Image(file="anim.jpg")
+    assert plugin._is_meme_image(comp_anim, "", event_anim, cfg) is True
+
+    # 3. NapCat subType = 0 (普通图片 / 截图)
+    event_real = _DummyGroupEvent(message_id="12")
+    event_real.message_obj.raw_message = {
+        "message": [{"type": "image", "data": {"file": "screen.png", "subType": "0", "summary": "[图片]"}}]
+    }
+    comp_real = Image(file="screen.png")
+    # 无本地文件时，仅根据协议判定为非表情包
+    assert plugin._is_meme_image(comp_real, "", event_real, cfg) is False
+
+    # 4. 本地文件为 .gif 动图
+    assert plugin._is_meme_image(comp_real, "/path/to/funny.gif", event_real, cfg) is True
 

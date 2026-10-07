@@ -52,6 +52,24 @@
                 "hint": "未开启图片转述时，注入上下文自动将最新的几张历史图片作为原图喂给支持多模态的模型（设为0则不自动挂载）。",
                 "type": "int",
                 "default": 3
+            },
+            "attached_images_scan_messages": {
+                "description": "挂载图片扫描消息数",
+                "hint": "限定仅从最近 N 条历史消息中扫描可读取的图片（设为0则不扫描，即不自动挂载）。若这 N 条消息内无图片，则不进行图片挂载。此配置项与群聊最大消息数（max_messages）互不影响。",
+                "type": "int",
+                "default": 10
+            },
+            "filter_memes": {
+                "description": "识别并过滤表情包",
+                "hint": "基于 NapCat 协议元数据（subType/summary）、动图及尺寸特征识别表情包。表情包在历史中标记为 [Meme]，普通图片与截图标记为 [Image]；开启后挂载原图时自动跳过表情包，防止挤占多模态额度。",
+                "type": "bool",
+                "default": true
+            },
+            "meme_max_dimension": {
+                "description": "表情包判定尺寸上限（像素）",
+                "hint": "若图片长宽均不超过此阈值（且非长条图），判定为表情包。设为 0 则仅依赖 NapCat 协议元数据与动图检测，不依赖分辨率。",
+                "type": "int",
+                "default": 400
             }
         }
     },
