@@ -117,3 +117,12 @@ def test_quote_keeps_text_when_target_will_be_evicted_by_current_message() -> No
 
     assert retained_history == (history_lines[1],)
     assert quote == " [Quote #msg1 最旧用户: 即将淘汰的原文]"
+
+
+def test_interaction_instructions_no_refuse_and_natural_quote() -> None:
+    from astrbot_plugin_astrbot_enhance_mode.tag_utils import build_interaction_instructions
+    instructions = build_interaction_instructions(mention_parse=True, include_sender_id=True)
+    assert "Refuse" not in instructions
+    assert "<refuse/>" not in instructions
+    assert "DO NOT quote every single message" in instructions
+    assert "DO NOT mention the user" in instructions

@@ -1,9 +1,14 @@
 # AstrBot Enhance Mode
 
-**Version**: `v0.2.5`
+**Version**: `v0.2.6`
 **Author**: `阿汐`
 
 `astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG、网页浏览与可视化 WebUI。
+
+## Update Notes (v0.2.6)
+
+- 彻底移除 `<refuse/>` 交互指令与相关拦截逻辑，避免大模型产生指令冲突或混杂输出。
+- 优化 `<mention/>` 与 `<quote/>` 提示词指令，删除强制性引用要求，引导模型以更自然、克制的方式在群内交流。
 
 ## Update Notes (v0.2.5)
 
@@ -22,19 +27,15 @@
 1. 回复（Reply）
 - Bot 决定何时说话、如何说话，并通过 `<mention/>`、`<quote/>` 表达互动意图。
 
-2. 拒绝回复（Refuse）
-- Bot 可以通过 `<refuse/>` 主动不发送本轮回复。
-- 这是行为边界，不是异常状态。
-
-3. 忽略某人消息（Ban）
+2. 忽略某人消息（Ban）
 - 这里的 `ban` 是 Bot 侧的“忽略/不处理”策略，不是平台管理员禁言。
 - 不要求 Bot 拥有群管理权限，也不会对平台侧用户状态做修改。
 
-4. 记忆与回忆（Memory RAG）
+3. 记忆与回忆（Memory RAG）
 - Bot 可以写入经历、按条件检索回忆，并在跨会话/跨群场景维持人格连续性。
 - `ignore_group_id=true` 用于跨群读取，服务于“同一人格的一体化记忆”。
 
-这四类能力共同构成了 Bot 的完整生命周期：表达、克制、选择性互动、持续成长。
+这些能力共同构成了 Bot 的行动生命周期：表达、选择性互动与持续成长。
 
 ## Features
 
@@ -56,7 +57,6 @@
 
 - `<mention id="..."/>`：转为平台 At 组件
 - `<quote id="..."/>`：转为平台引用组件
-- `<refuse/>`：触发拒绝发送，清空结果链
 
 ### Ban Control
 
@@ -230,7 +230,6 @@ agent-browser install
 ```text
 <mention id="user_id"/>
 <quote id="msg_id"/>
-<refuse/>
 ```
 
 ### WebUI Command

@@ -46,9 +46,7 @@ from .runtime_state import RuntimeState
 from .tag_utils import (
     bounded_chat_history_text,
     build_interaction_instructions,
-    chain_has_refuse_tag,
     clean_response_text_for_history,
-    has_refuse_tag,
     transform_result_chain,
 )
 from .webui import RAGWebUIServer
@@ -2448,7 +2446,7 @@ class Main(star.Star):
                     f"is as follows:\n{bounded_history_through_current}\n\n"
                     "You decided to actively join this conversation because some recent messages are worth replying to.\n"
                     "Choose the message(s) you want to respond to from the chat history above, "
-                    "and compose a natural reply. Quote the message you choose in most cases.\n"
+                    "and compose a natural reply. Reply naturally like a normal chatroom member without unnecessary quotes or mentions.\n"
                     "Only output your response and do not output any other information. "
                     "You MUST use the SAME language as the chatroom is using."
                     f"{interaction_instructions}"
@@ -2470,17 +2468,6 @@ class Main(star.Star):
     async def parse_tags(self, event: AstrMessageEvent) -> None:
         result = event.get_result()
         if not result or not result.chain:
-            return
-
-        # 全局拦截：模型输出 <refuse/> 时直接清空结果链，阻止后续发送到平台。
-        if chain_has_refuse_tag(result.chain):
-            logger.info(
-                "enhance-mode | 检测到 <refuse/>，已取消发送 | "
-                f"origin={event.unified_msg_origin}"
-            )
-            if hasattr(event, "set_extra"):
-                event.set_extra("_enhance_refused_reply", True)
-            result.chain = []
             return
 
         if event.get_message_type() != MessageType.GROUP_MESSAGE:
@@ -2505,13 +2492,6 @@ class Main(star.Star):
         if event.unified_msg_origin not in self.runtime.session_chats:
             return
         if not resp.completion_text:
-            return
-
-        if has_refuse_tag(resp.completion_text):
-            logger.info(
-                "enhance-mode | 检测到 <refuse/>，跳过机器人回复历史记录 | "
-                f"origin={event.unified_msg_origin}"
-            )
             return
 
         datetime_str = datetime.datetime.now().strftime("%H:%M:%S")

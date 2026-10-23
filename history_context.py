@@ -137,7 +137,7 @@ def build_current_message_reply_prompt(
         f"The chat history before the current message is as follows:\n{history_text}\n\n"
         f"Current message to reply to:\n{current_message}\n\n"
         "Reply to the current message above. Your entire output is your reply to this message. "
-        "Quote the current message in most cases. "
+        "Reply naturally like a normal chatroom member. Do not quote or mention unless clearly necessary. "
         "Only output your response and do not output any other information. "
         "You MUST use the SAME language as the chatroom is using."
         f"{interaction_instructions}"
