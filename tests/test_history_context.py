@@ -61,6 +61,8 @@ def test_current_message_reply_prompt_contains_target_once() -> None:
     assert prompt.count("#msg2") == 1
     assert "Current message to reply to:" in prompt
     assert "Reply to the current message above." in prompt
+    assert "[Context Rules]" in prompt
+    assert "[You/...]" in prompt
 
 
 def test_format_quote_omits_text_when_target_is_in_history() -> None:

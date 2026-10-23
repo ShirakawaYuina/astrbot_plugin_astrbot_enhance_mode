@@ -1,9 +1,13 @@
 # AstrBot Enhance Mode
 
-**Version**: `v0.2.6`
+**Version**: `v0.2.7`
 **Author**: `阿汐`
 
 `astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG、网页浏览与可视化 WebUI。
+
+## Update Notes (v0.2.7)
+
+- 优化群聊提示词，增加 `[Context Rules]` 对话目标判定准则：明确历史中 `[You/...]` 为自身发言；引导模型在用户无 @、无引用但语义直接承接自己发言时，准确识别说话对象并自然回应，避免误判与抢答。
 
 ## Update Notes (v0.2.6)
 

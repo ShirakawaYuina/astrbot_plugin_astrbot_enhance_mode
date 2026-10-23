@@ -2442,8 +2442,11 @@ class Main(star.Star):
             if is_active_triggered and active_mode == "model_choice":
                 # model_choice 可以从截至触发消息的历史中选目标，但不得看到之后到达的消息。
                 req.prompt = (
-                    "You are now in a chatroom. The chat history through the triggering message "
-                    f"is as follows:\n{bounded_history_through_current}\n\n"
+                    "You are now in a chatroom.\n"
+                    f"The chat history through the triggering message is as follows:\n{bounded_history_through_current}\n\n"
+                    "[Context Rules]\n"
+                    "1. Lines starting with `[You/...]` in history are your own previous messages.\n"
+                    "2. If a message follows up on your prior statement, the user is talking to you. If members are chatting among themselves, you are actively joining/chiming in.\n\n"
                     "You decided to actively join this conversation because some recent messages are worth replying to.\n"
                     "Choose the message(s) you want to respond to from the chat history above, "
                     "and compose a natural reply. Reply naturally like a normal chatroom member without unnecessary quotes or mentions.\n"

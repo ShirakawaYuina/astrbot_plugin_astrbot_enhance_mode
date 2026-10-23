@@ -130,14 +130,28 @@ def build_current_message_reply_prompt(
     current_message: str,
     interaction_instructions: str,
 ) -> str:
-    """构造普通回复提示词，确保当前回复目标只出现一次。"""
+    """构造普通回复提示词，包含上下文指向判定规则与单次回复目标。
 
+    Args:
+        history_text: 边界截断后的群聊历史文本。
+        current_message: 当前待回复的目标消息文本。
+        interaction_instructions: 交互说明指令。
+
+    Returns:
+        最终注入到请求中的 user prompt。
+    """
     return (
-        "You are now in a chatroom. "
+        "You are now in a chatroom.\n"
         f"The chat history before the current message is as follows:\n{history_text}\n\n"
+        "[Context Rules]\n"
+        "1. Lines starting with `[You/...]` in history are your own previous messages.\n"
+        "2. Target recognition:\n"
+        "   - If the current message directly continues, answers, or challenges the topic of your latest `[You/...]` message (even without @ or quote), the user IS talking to you. Reply naturally as their conversation partner.\n"
+        "   - If the current message explicitly mentions someone else ([At: other]) or quotes another member, they are talking to that person. If you reply, treat it as chiming into their discussion, not as a direct question to you.\n"
+        "   - If the message has no tags and relates to an ongoing back-and-forth between other members, do not mistake it as addressing you directly.\n\n"
         f"Current message to reply to:\n{current_message}\n\n"
         "Reply to the current message above. Your entire output is your reply to this message. "
-        "Reply naturally like a normal chatroom member. Do not quote or mention unless clearly necessary. "
+        "Compose a natural, concise reply like a real chatroom member. Do not quote or mention unless clearly necessary. "
         "Only output your response and do not output any other information. "
         "You MUST use the SAME language as the chatroom is using."
         f"{interaction_instructions}"
