@@ -128,3 +128,61 @@ def test_interaction_instructions_no_refuse_and_natural_quote() -> None:
     assert "<refuse/>" not in instructions
     assert "DO NOT quote every single message" in instructions
     assert "DO NOT mention the user" in instructions
+
+
+def test_normalize_quote_id() -> None:
+    from astrbot_plugin_astrbot_enhance_mode.tag_utils import normalize_quote_id
+    assert normalize_quote_id("#msg57871096") == "57871096"
+    assert normalize_quote_id("[#msg57871096]") == "57871096"
+    assert normalize_quote_id("msg12345") == "12345"
+    assert normalize_quote_id("#12345") == "12345"
+    assert normalize_quote_id("12345") == "12345"
+    assert normalize_quote_id("") == ""
+    assert normalize_quote_id(None) == ""
+
+
+def test_transform_result_chain_citation_compatibility() -> None:
+    from astrbot.api.message_components import Plain, Reply
+    from astrbot_plugin_astrbot_enhance_mode.tag_utils import transform_result_chain
+
+    # 1. <citation>#msg12345</citation> 容器标签转换
+    chain = [Plain(text="<citation>#msg57871096</citation> 好的收到")]
+    transformed = transform_result_chain(chain, parse_mention=True)
+    assert transformed is not None
+    assert len(transformed) == 2
+    assert isinstance(transformed[0], Reply)
+    assert transformed[0].id == "57871096"
+    assert isinstance(transformed[1], Plain)
+    assert transformed[1].text == "好的收到"
+
+    # 2. <citation id="57871096"/> 自闭合标签转换
+    chain2 = [Plain(text='<citation id="57871096"/>这也算引用')]
+    transformed2 = transform_result_chain(chain2, parse_mention=True)
+    assert transformed2 is not None
+    assert isinstance(transformed2[0], Reply)
+    assert transformed2[0].id == "57871096"
+    assert transformed2[1].text == "这也算引用"
+
+
+def test_transform_result_chain_strips_meta_chip() -> None:
+    from astrbot.api.message_components import Plain
+    from astrbot_plugin_astrbot_enhance_mode.tag_utils import transform_result_chain
+
+    chain = [Plain(text='摸摸头，别慌～<meta chip="img3"/> 挨批也是暂时的')]
+    transformed = transform_result_chain(chain, parse_mention=True)
+    assert transformed is not None
+    assert len(transformed) == 1
+    assert transformed[0].text == "摸摸头，别慌～ 挨批也是暂时的"
+    assert "<meta" not in transformed[0].text
+    assert "img3" not in transformed[0].text
+
+
+def test_clean_response_text_strips_citation_and_meta() -> None:
+    from astrbot_plugin_astrbot_enhance_mode.tag_utils import clean_response_text_for_history
+
+    raw = '<citation>#msg57871096</citation> 摸摸头～<meta chip="img3"/> 别慌'
+    cleaned = clean_response_text_for_history(raw)
+    assert cleaned == "摸摸头～ 别慌"
+    assert "citation" not in cleaned
+    assert "meta" not in cleaned
+    assert "img3" not in cleaned

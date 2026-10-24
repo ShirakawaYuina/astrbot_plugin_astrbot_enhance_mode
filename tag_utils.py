@@ -10,6 +10,18 @@ QUOTE_RE = re.compile(
     r"""<quote\s+id\s*=\s*['"]([^'"]+)['"]\s*/?>""",
     re.IGNORECASE,
 )
+CITATION_RE = re.compile(
+    r"""<citation(?:\s+id\s*=\s*['"]([^'"]+)['"])?\s*>(.*?)</citation\s*>|<citation\s+id\s*=\s*['"]([^'"]+)['"]\s*/?>""",
+    re.IGNORECASE | re.DOTALL,
+)
+CITATION_TAG_ONLY_RE = re.compile(
+    r"""<citation(?:\s+[^>]*)?>.*?</citation\s*>|<citation\s+[^>]*\/?>|</citation\s*>""",
+    re.IGNORECASE | re.DOTALL,
+)
+META_CHIP_RE = re.compile(
+    r"""<(?:meta|chip)\b[^>]*>(?:.*?</(?:meta|chip)>)?|<(?:meta|chip)\b[^>]*\/?>|</(?:meta|chip)\s*>""",
+    re.IGNORECASE | re.DOTALL,
+)
 MENTION_CLOSE_RE = re.compile(r"</mention\s*>", re.IGNORECASE)
 QUOTE_CLOSE_RE = re.compile(r"</quote\s*>", re.IGNORECASE)
 
@@ -25,16 +37,18 @@ def normalize_quote_id(raw_id: str | None) -> str:
     """
     if not raw_id:
         return ""
-    quote_id = str(raw_id).strip()
+    quote_id = str(raw_id).strip().strip("[]()")
     if quote_id.startswith("#"):
         quote_id = quote_id[1:]
     if quote_id.lower().startswith("msg"):
         quote_id = quote_id[3:]
+    if quote_id.startswith("_") or quote_id.startswith("-") or quote_id.startswith(":"):
+        quote_id = quote_id[1:]
     return quote_id.strip()
 
 
 def transform_result_chain(chain: list, parse_mention: bool) -> list | None:
-    """解析回复链中的控制标签（Mention 和 Quote），转换为平台原生消息组件。
+    """解析回复链中的控制标签（Mention 和 Quote/Citation），转换为平台原生消息组件并过滤幻觉元标签。
 
     Args:
         chain: 待转换的消息组件列表。
@@ -44,19 +58,31 @@ def transform_result_chain(chain: list, parse_mention: bool) -> list | None:
         转换后的新消息组件列表；若无相关标签则返回 None。
     """
     quote_msg_id = None
-    if any(isinstance(comp, Plain) and QUOTE_RE.search(comp.text) for comp in chain):
+    for comp in chain:
+        if isinstance(comp, Plain):
+            matched = QUOTE_RE.search(comp.text)
+            if matched:
+                quote_msg_id = normalize_quote_id(matched.group(1))
+                break
+
+    if not quote_msg_id:
         for comp in chain:
             if isinstance(comp, Plain):
-                matched = QUOTE_RE.search(comp.text)
+                matched = CITATION_RE.search(comp.text)
                 if matched:
-                    quote_msg_id = normalize_quote_id(matched.group(1))
-                    break
+                    raw_id = matched.group(1) or matched.group(2) or matched.group(3)
+                    candidate = normalize_quote_id(raw_id)
+                    if candidate and not re.search(r"\s", candidate):
+                        quote_msg_id = candidate
+                        break
 
     has_tags = any(
         isinstance(comp, Plain)
         and (
             QUOTE_RE.search(comp.text)
             or QUOTE_CLOSE_RE.search(comp.text)
+            or CITATION_TAG_ONLY_RE.search(comp.text)
+            or META_CHIP_RE.search(comp.text)
             or MENTION_CLOSE_RE.search(comp.text)
             or (parse_mention and MENTION_RE.search(comp.text))
         )
@@ -73,6 +99,11 @@ def transform_result_chain(chain: list, parse_mention: bool) -> list | None:
 
         text = QUOTE_RE.sub("", comp.text)
         text = QUOTE_CLOSE_RE.sub("", text)
+        text = CITATION_TAG_ONLY_RE.sub("", text)
+        text = META_CHIP_RE.sub("", text)
+
+        if quote_msg_id and not new_chain:
+            text = text.lstrip()
 
         if parse_mention and MENTION_RE.search(text):
             parts = MENTION_RE.split(text)
@@ -107,6 +138,8 @@ def clean_response_text_for_history(completion_text: str) -> str:
     text = MENTION_CLOSE_RE.sub("", text)
     text = QUOTE_RE.sub("", text)
     text = QUOTE_CLOSE_RE.sub("", text)
+    text = CITATION_TAG_ONLY_RE.sub("", text)
+    text = META_CHIP_RE.sub("", text)
     return text.strip()
 
 
@@ -138,7 +171,7 @@ def build_interaction_instructions(
         'Use `<quote id="msg_id"/>` ONLY when clearly necessary (e.g. replying to an older message from earlier, clarifying your target among interleaved conversations, or specifically countering a point).\n'
         "In normal conversational flow, DO NOT quote every single message. Prefer direct, natural replies without quote.\n"
         'If quoting, place it at the very beginning: `<quote id="12345"/> I agree with this!\n'
-        "The msg_id can be found in the chat history after #msg (e.g. #msg12345). Only quote at most ONE message per reply, and do NOT output closing tag </quote>."
+        "The msg_id can be found in the chat history after #msg (e.g. #msg12345). Only quote at most ONE message per reply, and do NOT output closing tag </quote> or <citation> tags."
     )
     return instructions
 
